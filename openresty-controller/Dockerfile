@@ -1,4 +1,4 @@
-FROM tzumby/openresty-waf:0.0.2
+FROM tzumby/openresty-waf
 
 # forward nginx access and error logs to stdout and stderr of the ingress
 # controller process
