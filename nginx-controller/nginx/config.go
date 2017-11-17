@@ -4,12 +4,14 @@ package nginx
 type Config struct {
 	LocationSnippets              []string
 	ServerSnippets                []string
-	ServerTokens                  bool
+	ServerTokens                  string
 	ProxyConnectTimeout           string
 	ProxyReadTimeout              string
 	ClientMaxBodySize             string
 	HTTP2                         bool
 	RedirectToHTTPS               bool
+	SSLRedirect                   bool
+	MainMainSnippets              []string
 	MainHTTPSnippets              []string
 	MainServerNamesHashBucketSize string
 	MainServerNamesHashMaxSize    string
@@ -24,6 +26,11 @@ type Config struct {
 	HSTS                          bool
 	HSTSMaxAge                    int64
 	HSTSIncludeSubdomains         bool
+	LBMethod                      string
+	MainWorkerProcesses           string
+	MainWorkerCPUAffinity         string
+	MainWorkerShutdownTimeout     string
+	Keepalive                     int64
 
 	// http://nginx.org/en/docs/http/ngx_http_realip_module.html
 	RealIPHeader    string
@@ -35,17 +42,29 @@ type Config struct {
 	MainServerSSLPreferServerCiphers bool
 	MainServerSSLCiphers             string
 	MainServerSSLDHParam             string
+
+	JWTRealm    string
+	JWTKey      string
+	JWTToken    string
+	JWTLoginURL string
+
+	Ports    []int
+	SSLPorts []int
 }
 
 // NewDefaultConfig creates a Config with default values
 func NewDefaultConfig() *Config {
 	return &Config{
-		ServerTokens:               true,
+		ServerTokens:               "on",
 		ProxyConnectTimeout:        "60s",
 		ProxyReadTimeout:           "60s",
 		ClientMaxBodySize:          "1m",
+		SSLRedirect:                true,
 		MainServerNamesHashMaxSize: "512",
 		ProxyBuffering:             true,
+		MainWorkerProcesses:        "auto",
 		HSTSMaxAge:                 2592000,
+		Ports:                      []int{80},
+		SSLPorts:                   []int{443},
 	}
 }

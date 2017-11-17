@@ -26,8 +26,15 @@ osx-nginx-ingress
 nginx-ingress
 osx-nginx-plus-ingress
 nginx-plus-ingress
+nginx-controller/nginx-controller
 
 # NGINX Plus license files
 *.crt
 *.key
+
+# Visual Studio Code settings
+.vscode
+
+# Default certificate and key
+default.pem
 

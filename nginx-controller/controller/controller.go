@@ -29,7 +29,10 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
+	scheme "k8s.io/client-go/kubernetes/scheme"
+	core_v1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	api_v1 "k8s.io/client-go/pkg/api/v1"
@@ -49,40 +52,58 @@ type LoadBalancerController struct {
 	svcController        cache.Controller
 	endpController       cache.Controller
 	cfgmController       cache.Controller
+	secrController       cache.Controller
 	ingLister            StoreToIngressLister
 	svcLister            cache.Store
 	endpLister           StoreToEndpointLister
 	cfgmLister           StoreToConfigMapLister
-	ingQueue             *taskQueue
-	endpQueue            *taskQueue
-	cfgmQueue            *taskQueue
+	secrLister           StoreToSecretLister
+	syncQueue            *taskQueue
 	stopCh               chan struct{}
 	cnf                  *nginx.Configurator
 	watchNginxConfigMaps bool
+	nginxPlus            bool
+	recorder             record.EventRecorder
+	defaultServerSecret  string
+	ingressClass         string
+	useIngressClassOnly  bool
 }
 
 var keyFunc = cache.DeletionHandlingMetaNamespaceKeyFunc
 
 // NewLoadBalancerController creates a controller
-func NewLoadBalancerController(kubeClient kubernetes.Interface, resyncPeriod time.Duration, namespace string, cnf *nginx.Configurator, nginxConfigMaps string) (*LoadBalancerController, error) {
+func NewLoadBalancerController(kubeClient kubernetes.Interface, resyncPeriod time.Duration, namespace string, cnf *nginx.Configurator, nginxConfigMaps string, defaultServerSecret string, nginxPlus bool, ingressClass string, useIngressClassOnly bool) (*LoadBalancerController, error) {
 	lbc := LoadBalancerController{
-		client: kubeClient,
-		stopCh: make(chan struct{}),
-		cnf:    cnf,
+		client:              kubeClient,
+		stopCh:              make(chan struct{}),
+		cnf:                 cnf,
+		defaultServerSecret: defaultServerSecret,
+		nginxPlus:           nginxPlus,
+		ingressClass:        ingressClass,
+		useIngressClassOnly: useIngressClassOnly,
 	}
 
-	lbc.ingQueue = NewTaskQueue(lbc.syncIng)
-	lbc.endpQueue = NewTaskQueue(lbc.syncEndp)
+	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartLogging(glog.Infof)
+	eventBroadcaster.StartRecordingToSink(&core_v1.EventSinkImpl{
+		Interface: core_v1.New(kubeClient.Core().RESTClient()).Events(""),
+	})
+	lbc.recorder = eventBroadcaster.NewRecorder(scheme.Scheme,
+		api_v1.EventSource{Component: "nginx-ingress-controller"})
+
+	lbc.syncQueue = NewTaskQueue(lbc.sync)
+
+	glog.V(3).Infof("Nginx Ingress Controller has class: %v", ingressClass)
 
 	ingHandlers := cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			addIng := obj.(*extensions.Ingress)
-			if !isNginxIngress(addIng) {
+			if !lbc.isNginxIngress(addIng) {
 				glog.Infof("Ignoring Ingress %v based on Annotation %v", addIng.Name, ingressClassKey)
 				return
 			}
 			glog.V(3).Infof("Adding Ingress: %v", addIng.Name)
-			lbc.ingQueue.enqueue(obj)
+			lbc.syncQueue.enqueue(obj)
 		},
 		DeleteFunc: func(obj interface{}) {
 			remIng, isIng := obj.(*extensions.Ingress)
@@ -98,20 +119,20 @@ func NewLoadBalancerController(kubeClient kubernetes.Interface, resyncPeriod tim
 					return
 				}
 			}
-			if !isNginxIngress(remIng) {
+			if !lbc.isNginxIngress(remIng) {
 				return
 			}
 			glog.V(3).Infof("Removing Ingress: %v", remIng.Name)
-			lbc.ingQueue.enqueue(obj)
+			lbc.syncQueue.enqueue(obj)
 		},
 		UpdateFunc: func(old, cur interface{}) {
 			curIng := cur.(*extensions.Ingress)
-			if !isNginxIngress(curIng) {
+			if !lbc.isNginxIngress(curIng) {
 				return
 			}
 			if !reflect.DeepEqual(old, cur) {
 				glog.V(3).Infof("Ingress %v changed, syncing", curIng.Name)
-				lbc.ingQueue.enqueue(cur)
+				lbc.syncQueue.enqueue(cur)
 			}
 		},
 	}
@@ -158,7 +179,7 @@ func NewLoadBalancerController(kubeClient kubernetes.Interface, resyncPeriod tim
 		AddFunc: func(obj interface{}) {
 			addEndp := obj.(*api_v1.Endpoints)
 			glog.V(3).Infof("Adding endpoints: %v", addEndp.Name)
-			lbc.endpQueue.enqueue(obj)
+			lbc.syncQueue.enqueue(obj)
 		},
 		DeleteFunc: func(obj interface{}) {
 			remEndp, isEndp := obj.(*api_v1.Endpoints)
@@ -175,13 +196,13 @@ func NewLoadBalancerController(kubeClient kubernetes.Interface, resyncPeriod tim
 				}
 			}
 			glog.V(3).Infof("Removing endpoints: %v", remEndp.Name)
-			lbc.endpQueue.enqueue(obj)
+			lbc.syncQueue.enqueue(obj)
 		},
 		UpdateFunc: func(old, cur interface{}) {
 			if !reflect.DeepEqual(old, cur) {
 				glog.V(3).Infof("Endpoints %v changed, syncing",
 					cur.(*api_v1.Endpoints).Name)
-				lbc.endpQueue.enqueue(cur)
+				lbc.syncQueue.enqueue(cur)
 			}
 		},
 	}
@@ -189,20 +210,68 @@ func NewLoadBalancerController(kubeClient kubernetes.Interface, resyncPeriod tim
 		cache.NewListWatchFromClient(lbc.client.Core().RESTClient(), "endpoints", namespace, fields.Everything()),
 		&api_v1.Endpoints{}, resyncPeriod, endpHandlers)
 
+	secrHandlers := cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			secr := obj.(*api_v1.Secret)
+			nsname := secr.Namespace + "/" + secr.Name
+			if nsname == lbc.defaultServerSecret {
+				glog.V(3).Infof("Adding default server Secret: %v", secr.Name)
+				lbc.syncQueue.enqueue(obj)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			remSecr, isSecr := obj.(*api_v1.Secret)
+			if !isSecr {
+				deletedState, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					glog.V(3).Infof("Error received unexpected object: %v", obj)
+					return
+				}
+				remSecr, ok = deletedState.Obj.(*api_v1.Secret)
+				if !ok {
+					glog.V(3).Infof("Error DeletedFinalStateUnknown contained non-Secret object: %v", deletedState.Obj)
+					return
+				}
+			}
+			if err := lbc.ValidateSecret(remSecr); err != nil {
+				return
+			}
+
+			glog.V(3).Infof("Removing Secret: %v", remSecr.Name)
+			lbc.syncQueue.enqueue(obj)
+		},
+		UpdateFunc: func(old, cur interface{}) {
+			errOld := lbc.ValidateSecret(old.(*api_v1.Secret))
+			errCur := lbc.ValidateSecret(cur.(*api_v1.Secret))
+			if errOld != nil && errCur != nil {
+				return
+			}
+
+			if !reflect.DeepEqual(old, cur) {
+				glog.V(3).Infof("Secret %v changed, syncing",
+					cur.(*api_v1.Secret).Name)
+				lbc.syncQueue.enqueue(cur)
+			}
+		},
+	}
+
+	lbc.secrLister.Store, lbc.secrController = cache.NewInformer(
+		cache.NewListWatchFromClient(lbc.client.Core().RESTClient(), "secrets", namespace, fields.Everything()),
+		&api_v1.Secret{}, resyncPeriod, secrHandlers)
+
 	if nginxConfigMaps != "" {
-		nginxConfigMapsNS, nginxConfigMapsName, err := parseNginxConfigMaps(nginxConfigMaps)
+		nginxConfigMapsNS, nginxConfigMapsName, err := ParseNamespaceName(nginxConfigMaps)
 		if err != nil {
 			glog.Warning(err)
 		} else {
 			lbc.watchNginxConfigMaps = true
-			lbc.cfgmQueue = NewTaskQueue(lbc.syncCfgm)
 
 			cfgmHandlers := cache.ResourceEventHandlerFuncs{
 				AddFunc: func(obj interface{}) {
 					cfgm := obj.(*api_v1.ConfigMap)
 					if cfgm.Name == nginxConfigMapsName {
 						glog.V(3).Infof("Adding ConfigMap: %v", cfgm.Name)
-						lbc.cfgmQueue.enqueue(obj)
+						lbc.syncQueue.enqueue(obj)
 					}
 				},
 				DeleteFunc: func(obj interface{}) {
@@ -221,7 +290,7 @@ func NewLoadBalancerController(kubeClient kubernetes.Interface, resyncPeriod tim
 					}
 					if cfgm.Name == nginxConfigMapsName {
 						glog.V(3).Infof("Removing ConfigMap: %v", cfgm.Name)
-						lbc.cfgmQueue.enqueue(obj)
+						lbc.syncQueue.enqueue(obj)
 					}
 				},
 				UpdateFunc: func(old, cur interface{}) {
@@ -230,7 +299,7 @@ func NewLoadBalancerController(kubeClient kubernetes.Interface, resyncPeriod tim
 						if cfgm.Name == nginxConfigMapsName {
 							glog.V(3).Infof("ConfigMap %v changed, syncing",
 								cur.(*api_v1.ConfigMap).Name)
-							lbc.cfgmQueue.enqueue(cur)
+							lbc.syncQueue.enqueue(cur)
 						}
 					}
 				},
@@ -246,24 +315,31 @@ func NewLoadBalancerController(kubeClient kubernetes.Interface, resyncPeriod tim
 
 // Run starts the loadbalancer controller
 func (lbc *LoadBalancerController) Run() {
-	go lbc.ingController.Run(lbc.stopCh)
 	go lbc.svcController.Run(lbc.stopCh)
 	go lbc.endpController.Run(lbc.stopCh)
-	go lbc.ingQueue.run(time.Second, lbc.stopCh)
-	go lbc.endpQueue.run(time.Second, lbc.stopCh)
+	go lbc.secrController.Run(lbc.stopCh)
 	if lbc.watchNginxConfigMaps {
 		go lbc.cfgmController.Run(lbc.stopCh)
-		go lbc.cfgmQueue.run(time.Second, lbc.stopCh)
 	}
+	go lbc.ingController.Run(lbc.stopCh)
+	go lbc.syncQueue.run(time.Second, lbc.stopCh)
 	<-lbc.stopCh
 }
 
-func (lbc *LoadBalancerController) syncEndp(key string) {
+// Stop shutdowns the load balancer controller
+func (lbc *LoadBalancerController) Stop() {
+	close(lbc.stopCh)
+
+	lbc.syncQueue.shutdown()
+}
+
+func (lbc *LoadBalancerController) syncEndp(task Task) {
+	key := task.Key
 	glog.V(3).Infof("Syncing endpoints %v", key)
 
 	obj, endpExists, err := lbc.endpLister.GetByKey(key)
 	if err != nil {
-		lbc.endpQueue.requeue(key, err)
+		lbc.syncQueue.requeue(task, err)
 		return
 	}
 
@@ -271,28 +347,33 @@ func (lbc *LoadBalancerController) syncEndp(key string) {
 		ings := lbc.getIngressForEndpoints(obj)
 
 		for _, ing := range ings {
-			if !isNginxIngress(&ing) {
+			if !lbc.isNginxIngress(&ing) {
+				continue
+			}
+			if !lbc.cnf.HasIngress(&ing) {
 				continue
 			}
 			ingEx, err := lbc.createIngress(&ing)
 			if err != nil {
-				glog.Warningf("Error updating endpoints for %v/%v: %v, skipping", ing.Namespace, ing.Name, err)
+				glog.Errorf("Error updating endpoints for %v/%v: %v, skipping", ing.Namespace, ing.Name, err)
 				continue
 			}
 			glog.V(3).Infof("Updating Endpoints for %v/%v", ing.Name, ing.Namespace)
-			name := ing.Namespace + "-" + ing.Name
-			lbc.cnf.UpdateEndpoints(name, ingEx)
+			lbc.cnf.UpdateEndpoints(ingEx)
+			if err != nil {
+				glog.Errorf("Error updating endpoints for %v/%v: %v", ing.Namespace, ing.Name, err)
+			}
 		}
 	}
-
 }
 
-func (lbc *LoadBalancerController) syncCfgm(key string) {
+func (lbc *LoadBalancerController) syncCfgm(task Task) {
+	key := task.Key
 	glog.V(3).Infof("Syncing configmap %v", key)
 
 	obj, cfgmExists, err := lbc.cfgmLister.GetByKey(key)
 	if err != nil {
-		lbc.cfgmQueue.requeue(key, err)
+		lbc.syncQueue.requeue(task, err)
 		return
 	}
 	cfg := nginx.NewDefaultConfig()
@@ -302,10 +383,21 @@ func (lbc *LoadBalancerController) syncCfgm(key string) {
 
 		if serverTokens, exists, err := nginx.GetMapKeyAsBool(cfgm.Data, "server-tokens", cfgm); exists {
 			if err != nil {
-				glog.Error(err)
+				if lbc.nginxPlus {
+					cfg.ServerTokens = cfgm.Data["server-tokens"]
+				} else {
+					glog.Error(err)
+				}
 			} else {
-				cfg.ServerTokens = serverTokens
+				cfg.ServerTokens = "off"
+				if serverTokens {
+					cfg.ServerTokens = "on"
+				}
 			}
+		}
+
+		if lbMethod, exists := cfgm.Data["lb-method"]; exists {
+			cfg.LBMethod = lbMethod
 		}
 
 		if proxyConnectTimeout, exists := cfgm.Data["proxy-connect-timeout"]; exists {
@@ -349,6 +441,13 @@ func (lbc *LoadBalancerController) syncCfgm(key string) {
 				glog.Error(err)
 			} else {
 				cfg.RedirectToHTTPS = redirectToHTTPS
+			}
+		}
+		if sslRedirect, exists, err := nginx.GetMapKeyAsBool(cfgm.Data, "ssl-redirect", cfgm); exists {
+			if err != nil {
+				glog.Error(err)
+			} else {
+				cfg.SSLRedirect = sslRedirect
 			}
 		}
 
@@ -455,6 +554,13 @@ func (lbc *LoadBalancerController) syncCfgm(key string) {
 			cfg.ProxyMaxTempFileSize = proxyMaxTempFileSize
 		}
 
+                if mainMainSnippets, exists, err := nginx.GetMapKeyAsStringSlice(cfgm.Data, "main-snippets", cfgm, "\n"); exists {
+                        if err != nil {
+                                glog.Error(err)
+                        } else {
+                                cfg.MainMainSnippets = mainMainSnippets
+                        }
+                }
 		if mainHTTPSnippets, exists, err := nginx.GetMapKeyAsStringSlice(cfgm.Data, "http-snippets", cfgm, "\n"); exists {
 			if err != nil {
 				glog.Error(err)
@@ -476,54 +582,242 @@ func (lbc *LoadBalancerController) syncCfgm(key string) {
 				cfg.ServerSnippets = serverSnippets
 			}
 		}
-
+		if _, exists, err := nginx.GetMapKeyAsInt(cfgm.Data, "worker-processes", cfgm); exists {
+			if err != nil && cfgm.Data["worker-processes"] != "auto" {
+				glog.Errorf("Configmap %s/%s: Invalid value for worker-processes key: must be an integer or the string 'auto', got %q", cfgm.GetNamespace(), cfgm.GetName(), cfgm.Data["worker-processes"])
+			} else {
+				cfg.MainWorkerProcesses = cfgm.Data["worker-processes"]
+			}
+		}
+		if workerCPUAffinity, exists := cfgm.Data["worker-cpu-affinity"]; exists {
+			cfg.MainWorkerCPUAffinity = workerCPUAffinity
+		}
+		if workerShutdownTimeout, exists := cfgm.Data["worker-shutdown-timeout"]; exists {
+			cfg.MainWorkerShutdownTimeout = workerShutdownTimeout
+		}
+		if keepalive, exists, err := nginx.GetMapKeyAsInt(cfgm.Data, "keepalive", cfgm); exists {
+			if err != nil {
+				glog.Error(err)
+			} else {
+				cfg.Keepalive = keepalive
+			}
+		}
 	}
-	lbc.cnf.UpdateConfig(cfg)
 
+	var ingExes []*nginx.IngressEx
 	ings, _ := lbc.ingLister.List()
-	for _, ing := range ings.Items {
-		if !isNginxIngress(&ing) {
+	for i := range ings.Items {
+		if !lbc.isNginxIngress(&ings.Items[i]) {
 			continue
 		}
-		lbc.ingQueue.enqueue(&ing)
+		if !lbc.cnf.HasIngress(&ings.Items[i]) {
+			continue
+		}
+		ingEx, err := lbc.createIngress(&ings.Items[i])
+		if err != nil {
+			continue
+		}
+
+		ingExes = append(ingExes, ingEx)
+	}
+
+	if err := lbc.cnf.UpdateConfig(cfg, ingExes); err != nil {
+		if cfgmExists {
+			cfgm := obj.(*api_v1.ConfigMap)
+			lbc.recorder.Eventf(cfgm, api_v1.EventTypeWarning, "UpdatedWithError", "Configuration from %v was updated, but not applied: %v", key, err)
+		}
+		for _, ingEx := range ingExes {
+			lbc.recorder.Eventf(ingEx.Ingress, api_v1.EventTypeWarning, "UpdatedWithError", "Configuration for %v/%v was updated, but not applied: %v",
+				ingEx.Ingress.Name, ingEx.Ingress.Namespace, err)
+		}
+	} else {
+		if cfgmExists {
+			cfgm := obj.(*api_v1.ConfigMap)
+			lbc.recorder.Eventf(cfgm, api_v1.EventTypeNormal, "Updated", "Configuration from %v was updated", key)
+		}
+		for _, ingEx := range ingExes {
+			lbc.recorder.Eventf(ingEx.Ingress, api_v1.EventTypeNormal, "Updated", "Configuration for %v/%v was updated", ingEx.Ingress.Name, ingEx.Ingress.Namespace)
+		}
 	}
 }
 
-func (lbc *LoadBalancerController) syncIng(key string) {
-	glog.V(3).Infof("Syncing %v", key)
+func (lbc *LoadBalancerController) sync(task Task) {
+	glog.V(3).Infof("Syncing %v", task.Key)
 
+	switch task.Kind {
+	case Ingress:
+		lbc.syncIng(task)
+	case ConfigMap:
+		lbc.syncCfgm(task)
+		return
+	case Endpoints:
+		lbc.syncEndp(task)
+		return
+	case Secret:
+		lbc.syncSecret(task)
+	}
+}
+
+func (lbc *LoadBalancerController) syncIng(task Task) {
+	key := task.Key
 	obj, ingExists, err := lbc.ingLister.Store.GetByKey(key)
 	if err != nil {
-		lbc.ingQueue.requeue(key, err)
+		lbc.syncQueue.requeue(task, err)
 		return
 	}
 
-	// defaut/some-ingress -> default-some-ingress
-	name := strings.Replace(key, "/", "-", -1)
-
 	if !ingExists {
 		glog.V(2).Infof("Deleting Ingress: %v\n", key)
-		lbc.cnf.DeleteIngress(name)
+		err := lbc.cnf.DeleteIngress(key)
+		if err != nil {
+			glog.Errorf("Error when deleting configuration for %v: %v", key, err)
+		}
 	} else {
 		glog.V(2).Infof("Adding or Updating Ingress: %v\n", key)
 
 		ing := obj.(*extensions.Ingress)
 		ingEx, err := lbc.createIngress(ing)
 		if err != nil {
-			lbc.ingQueue.requeueAfter(key, err, 5*time.Second)
+			lbc.syncQueue.requeueAfter(task, err, 5*time.Second)
+			lbc.recorder.Eventf(ing, api_v1.EventTypeWarning, "Rejected", "%v was rejected: %v", key, err)
 			return
 		}
-		lbc.cnf.AddOrUpdateIngress(name, ingEx)
+		err = lbc.cnf.AddOrUpdateIngress(ingEx)
+		if err != nil {
+			lbc.recorder.Eventf(ing, api_v1.EventTypeWarning, "AddedOrUpdatedWithError", "Configuration for %v was added or updated, but not applied: %v", key, err)
+		} else {
+			lbc.recorder.Eventf(ing, api_v1.EventTypeNormal, "AddedOrUpdated", "Configuration for %v was added or updated", key)
+		}
 	}
+}
+
+func (lbc *LoadBalancerController) syncSecret(task Task) {
+	key := task.Key
+	obj, secrExists, err := lbc.secrLister.Store.GetByKey(key)
+	if err != nil {
+		lbc.syncQueue.requeue(task, err)
+		return
+	}
+
+	_, name, err := ParseNamespaceName(key)
+	if err != nil {
+		glog.Warningf("Secret key %v is invalid: %v", key, err)
+		return
+	}
+
+	ings, err := lbc.findIngressesForSecret(name)
+	if err != nil {
+		glog.Warningf("Failed to find Ingress resources for Secret %v: %v", key, err)
+		lbc.syncQueue.requeueAfter(task, err, 5*time.Second)
+	}
+
+	glog.V(2).Infof("Found %v Ingress resources with Secret %v", len(ings), key)
+
+	if !secrExists {
+		glog.V(2).Infof("Deleting Secret: %v\n", key)
+
+		if err := lbc.cnf.DeleteSecret(key, ings); err != nil {
+			glog.Errorf("Error when deleting Secret: %v: %v", key, err)
+		}
+
+		for _, ing := range ings {
+			lbc.syncQueue.enqueue(&ing)
+			lbc.recorder.Eventf(&ing, api_v1.EventTypeWarning, "Rejected", "%v/%v was rejected due to deleted Secret %v: %v", ing.Namespace, ing.Name, key)
+		}
+
+		if key == lbc.defaultServerSecret {
+			glog.Warningf("The default server Secret %v was removed. Retaining the Secret.")
+		}
+	} else {
+		glog.V(2).Infof("Updating Secret: %v\n", key)
+
+		secret := obj.(*api_v1.Secret)
+
+		if key == lbc.defaultServerSecret {
+			err := nginx.ValidateTLSSecret(secret)
+			if err != nil {
+				glog.Errorf("Couldn't validate the default server Secret %v: %v", key, err)
+				lbc.recorder.Eventf(secret, api_v1.EventTypeWarning, "Rejected", "the default server Secret %v was rejected, using the previous version: %v", key, err)
+			} else {
+				err := lbc.cnf.AddOrUpdateDefaultServerTLSSecret(secret)
+				if err != nil {
+					glog.Errorf("Error when updating the default server Secret %v: %v", key, err)
+					lbc.recorder.Eventf(secret, api_v1.EventTypeWarning, "UpdatedWithError", "the default server Secret %v was updated, but not applied: %v", key, err)
+
+				} else {
+					lbc.recorder.Eventf(secret, api_v1.EventTypeNormal, "Updated", "the default server Secret %v was updated", key)
+				}
+			}
+		}
+
+		if len(ings) > 0 {
+			err := lbc.ValidateSecret(secret)
+			if err != nil {
+				glog.Errorf("Couldn't validate secret %v: %v", key, err)
+				if err := lbc.cnf.DeleteSecret(key, ings); err != nil {
+					glog.Errorf("Error when deleting Secret: %v: %v", key, err)
+				}
+				for _, ing := range ings {
+					lbc.syncQueue.enqueue(&ing)
+					lbc.recorder.Eventf(&ing, api_v1.EventTypeWarning, "Rejected", "%v/%v was rejected due to invalid Secret %v: %v", ing.Namespace, ing.Name, key, err)
+				}
+				lbc.recorder.Eventf(secret, api_v1.EventTypeWarning, "Rejected", "%v was rejected: %v", key, err)
+				return
+			}
+
+			if err := lbc.cnf.AddOrUpdateSecret(secret); err != nil {
+				glog.Errorf("Error when updating Secret %v: %v", key, err)
+				lbc.recorder.Eventf(secret, api_v1.EventTypeWarning, "UpdatedWithError", "%v was updated, but not applied: %v", key, err)
+				for _, ing := range ings {
+					lbc.recorder.Eventf(&ing, api_v1.EventTypeWarning, "UpdatedWithError", "Configuration for %v/%v was updated, but not applied: %v", ing.Namespace, ing.Name, err)
+				}
+			} else {
+				lbc.recorder.Eventf(secret, api_v1.EventTypeNormal, "Updated", "%v was updated", key)
+				for _, ing := range ings {
+					lbc.recorder.Eventf(&ing, api_v1.EventTypeNormal, "Updated", "Configuration for %v/%v was updated", ing.Namespace, ing.Name)
+				}
+			}
+		}
+	}
+}
+
+func (lbc *LoadBalancerController) findIngressesForSecret(secret string) ([]extensions.Ingress, error) {
+	res := []extensions.Ingress{}
+	ings, err := lbc.ingLister.List()
+	if err != nil {
+		return nil, fmt.Errorf("Couldn't get the list of Ingress resources: %v", err)
+	}
+
+items:
+	for _, ing := range ings.Items {
+		if !lbc.isNginxIngress(&ing) {
+			continue
+		}
+		for _, tls := range ing.Spec.TLS {
+			if tls.SecretName == secret {
+				res = append(res, ing)
+				continue items
+			}
+		}
+		if lbc.nginxPlus {
+			if jwtKey, exists := ing.Annotations[nginx.JWTKeyAnnotation]; exists {
+				if jwtKey == secret {
+					res = append(res, ing)
+				}
+			}
+		}
+	}
+
+	return res, nil
 }
 
 func (lbc *LoadBalancerController) enqueueIngressForService(svc *api_v1.Service) {
 	ings := lbc.getIngressesForService(svc)
 	for _, ing := range ings {
-		if !isNginxIngress(&ing) {
+		if !lbc.isNginxIngress(&ing) {
 			continue
 		}
-		lbc.ingQueue.enqueue(&ing)
+		lbc.syncQueue.enqueue(&ing)
 	}
 }
 
@@ -556,14 +850,36 @@ func (lbc *LoadBalancerController) createIngress(ing *extensions.Ingress) (*ngin
 		Ingress: ing,
 	}
 
-	ingEx.Secrets = make(map[string]*api_v1.Secret)
+	ingEx.TLSSecrets = make(map[string]*api_v1.Secret)
 	for _, tls := range ing.Spec.TLS {
 		secretName := tls.SecretName
 		secret, err := lbc.client.Core().Secrets(ing.Namespace).Get(secretName, meta_v1.GetOptions{})
 		if err != nil {
 			return nil, fmt.Errorf("Error retrieving secret %v for Ingress %v: %v", secretName, ing.Name, err)
 		}
-		ingEx.Secrets[secretName] = secret
+		err = nginx.ValidateTLSSecret(secret)
+		if err != nil {
+			return nil, fmt.Errorf("Error validating secret %v for Ingress %v: %v", secretName, ing.Name, err)
+		}
+		ingEx.TLSSecrets[secretName] = secret
+	}
+
+	if lbc.nginxPlus {
+		if jwtKey, exists := ingEx.Ingress.Annotations[nginx.JWTKeyAnnotation]; exists {
+			secretName := jwtKey
+
+			secret, err := lbc.client.Core().Secrets(ing.Namespace).Get(secretName, meta_v1.GetOptions{})
+			if err != nil {
+				return nil, fmt.Errorf("Error retrieving secret %v for Ingress %v: %v", secretName, ing.Name, err)
+			}
+
+			err = nginx.ValidateJWKSecret(secret)
+			if err != nil {
+				return nil, fmt.Errorf("Error validating secret %v for Ingress %v: %v", secretName, ing.Name, err)
+			}
+
+			ingEx.JWTKey = secret
+		}
 	}
 
 	ingEx.Endpoints = make(map[string][]string)
@@ -571,24 +887,38 @@ func (lbc *LoadBalancerController) createIngress(ing *extensions.Ingress) (*ngin
 		endps, err := lbc.getEndpointsForIngressBackend(ing.Spec.Backend, ing.Namespace)
 		if err != nil {
 			glog.Warningf("Error retrieving endpoints for the service %v: %v", ing.Spec.Backend.ServiceName, err)
+			ingEx.Endpoints[ing.Spec.Backend.ServiceName+ing.Spec.Backend.ServicePort.String()] = []string{}
 		} else {
 			ingEx.Endpoints[ing.Spec.Backend.ServiceName+ing.Spec.Backend.ServicePort.String()] = endps
 		}
 	}
+
+	validRules := 0
 
 	for _, rule := range ing.Spec.Rules {
 		if rule.IngressRuleValue.HTTP == nil {
 			continue
 		}
 
+		if rule.Host == "" {
+			return nil, fmt.Errorf("Ingress rule contains empty host")
+		}
+
 		for _, path := range rule.HTTP.Paths {
 			endps, err := lbc.getEndpointsForIngressBackend(&path.Backend, ing.Namespace)
 			if err != nil {
 				glog.Warningf("Error retrieving endpoints for the service %v: %v", path.Backend.ServiceName, err)
+				ingEx.Endpoints[path.Backend.ServiceName+path.Backend.ServicePort.String()] = []string{}
 			} else {
 				ingEx.Endpoints[path.Backend.ServiceName+path.Backend.ServicePort.String()] = endps
 			}
 		}
+
+		validRules++
+	}
+
+	if validRules == 0 {
+		return nil, fmt.Errorf("Ingress contains no valid rules")
 	}
 
 	return ingEx, nil
@@ -693,18 +1023,45 @@ func (lbc *LoadBalancerController) getServiceForIngressBackend(backend *extensio
 	return nil, fmt.Errorf("service %s doesn't exists", svcKey)
 }
 
-func parseNginxConfigMaps(nginxConfigMaps string) (string, string, error) {
-	res := strings.Split(nginxConfigMaps, "/")
+// ParseNamespaceName parses the string in the <namespace>/<name> format and returns the name and the namespace.
+// It returns an error in case the string does not follow the <namespace>/<name> format.
+func ParseNamespaceName(value string) (ns string, name string, err error) {
+	res := strings.Split(value, "/")
 	if len(res) != 2 {
-		return "", "", fmt.Errorf("NGINX configmaps name must follow the format <namespace>/<name>, got: %v", nginxConfigMaps)
+		return "", "", fmt.Errorf("%q must follow the format <namespace>/<name>", value)
 	}
 	return res[0], res[1], nil
 }
 
-func isNginxIngress(ing *extensions.Ingress) bool {
+// Check if resource ingress class annotatios (if exist) is matching with ingress controller class
+// If annotatins is absent and use-ingress-class-only enabled - ingress resource would ignore
+func (lbc *LoadBalancerController) isNginxIngress(ing *extensions.Ingress) bool {
 	if class, exists := ing.Annotations[ingressClassKey]; exists {
+		if lbc.useIngressClassOnly {
+			return class == lbc.ingressClass
+		}
 		return class == nginxIngressClass || class == ""
+	} else {
+		if lbc.useIngressClassOnly {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidateSecret validates that the secret follows the TLS Secret format.
+// For NGINX Plus, it also checks if the secret follows the JWK Secret format.
+func (lbc *LoadBalancerController) ValidateSecret(secret *api_v1.Secret) error {
+	err1 := nginx.ValidateTLSSecret(secret)
+	if !lbc.nginxPlus {
+		return err1
 	}
 
-	return true
+	err2 := nginx.ValidateJWKSecret(secret)
+
+	if err1 == nil || err2 == nil {
+		return nil
+	}
+
+	return fmt.Errorf("Secret is not a TLS or JWK secret")
 }

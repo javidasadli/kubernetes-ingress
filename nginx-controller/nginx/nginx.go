@@ -3,6 +3,7 @@ package nginx
 import (
 	"bytes"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
@@ -13,24 +14,33 @@ import (
 
 const dhparamFilename = "dhparam.pem"
 
+// TLSSecretFileMode defines the default filemode for files with TLS Secrets
+const TLSSecretFileMode = 0600
+const jwkSecretFileMode = 0644
+
 // NginxController Updates NGINX configuration, starts and reloads NGINX
 type NginxController struct {
-	nginxConfdPath string
-	nginxCertsPath string
-	local          bool
-	healthStatus   bool
+	nginxConfdPath          string
+	nginxSecretsPath        string
+	local                   bool
+	healthStatus            bool
+	nginxConfTemplatePath   string
+	nginxIngressTempatePath string
 }
 
 // IngressNginxConfig describes an NGINX configuration
 type IngressNginxConfig struct {
 	Upstreams []Upstream
 	Servers   []Server
+	Keepalive string
 }
 
 // Upstream describes an NGINX upstream
 type Upstream struct {
 	Name            string
 	UpstreamServers []UpstreamServer
+	StickyCookie    string
+	LBMethod        string
 }
 
 // UpstreamServer describes a server in an NGINX upstream
@@ -43,13 +53,15 @@ type UpstreamServer struct {
 type Server struct {
 	ServerSnippets        []string
 	Name                  string
-	ServerTokens          bool
+	ServerTokens          string
 	Locations             []Location
 	SSL                   bool
 	SSLCertificate        string
 	SSLCertificateKey     string
+	StatusZone            string
 	HTTP2                 bool
 	RedirectToHTTPS       bool
+	SSLRedirect           bool
 	ProxyProtocol         bool
 	HSTS                  bool
 	HSTSMaxAge            int64
@@ -61,6 +73,14 @@ type Server struct {
 	RealIPHeader    string
 	SetRealIPFrom   []string
 	RealIPRecursive bool
+
+	JWTKey      string
+	JWTRealm    string
+	JWTToken    string
+	JWTLoginURL string
+
+	Ports    []int
+	SSLPorts []int
 }
 
 // Location describes an NGINX location
@@ -86,12 +106,19 @@ type NginxMainConfig struct {
 	ServerNamesHashMaxSize    string
 	LogFormat                 string
 	HealthStatus              bool
+	MainSnippets              []string
 	HTTPSnippets              []string
 	// http://nginx.org/en/docs/http/ngx_http_ssl_module.html
 	SSLProtocols           string
 	SSLPreferServerCiphers bool
 	SSLCiphers             string
 	SSLDHParam             string
+	HTTP2                  bool
+	ServerTokens           string
+	ProxyProtocol          bool
+	WorkerProcesses        string
+	WorkerCPUAffinity      string
+	WorkerShutdownTimeout  string
 }
 
 // NewUpstreamWithDefaultServer creates an upstream with the default server.
@@ -105,19 +132,21 @@ func NewUpstreamWithDefaultServer(name string) Upstream {
 }
 
 // NewNginxController creates a NGINX controller
-func NewNginxController(nginxConfPath string, local bool, healthStatus bool) (*NginxController, error) {
+func NewNginxController(nginxConfPath string, local bool, healthStatus bool, nginxConfTemplatePath string, nginxIngressTemplatePath string) (*NginxController, error) {
 	ngxc := NginxController{
-		nginxConfdPath: path.Join(nginxConfPath, "conf.d"),
-		nginxCertsPath: path.Join(nginxConfPath, "ssl"),
-		local:          local,
-		healthStatus:   healthStatus,
+		nginxConfdPath:          path.Join(nginxConfPath, "conf.d"),
+		nginxSecretsPath:        path.Join(nginxConfPath, "secrets"),
+		local:                   local,
+		healthStatus:            healthStatus,
+		nginxConfTemplatePath:   nginxConfTemplatePath,
+		nginxIngressTempatePath: nginxIngressTemplatePath,
 	}
 
-	if !local {
-		createDir(ngxc.nginxCertsPath)
+	cfg := &NginxMainConfig{
+		ServerNamesHashMaxSize: NewDefaultConfig().MainServerNamesHashMaxSize,
+		ServerTokens:           NewDefaultConfig().ServerTokens,
+		WorkerProcesses:        NewDefaultConfig().MainWorkerProcesses,
 	}
-
-	cfg := &NginxMainConfig{ServerNamesHashMaxSize: NewDefaultConfig().MainServerNamesHashMaxSize}
 	ngxc.UpdateMainConfigFile(cfg)
 
 	return &ngxc, nil
@@ -146,7 +175,7 @@ func (nginx *NginxController) AddOrUpdateIngress(name string, config IngressNgin
 
 // AddOrUpdateDHParam creates the servers dhparam.pem file
 func (nginx *NginxController) AddOrUpdateDHParam(dhparam string) (string, error) {
-	fileName := nginx.nginxCertsPath + "/" + dhparamFilename
+	fileName := nginx.nginxSecretsPath + "/" + dhparamFilename
 	if !nginx.local {
 		pem, err := os.Create(fileName)
 		if err != nil {
@@ -162,45 +191,65 @@ func (nginx *NginxController) AddOrUpdateDHParam(dhparam string) (string, error)
 	return fileName, nil
 }
 
-// AddOrUpdateCertAndKey creates a .pem file wth the cert and the key with the
-// specified name
-func (nginx *NginxController) AddOrUpdateCertAndKey(name string, cert string, key string) string {
-	pemFileName := nginx.nginxCertsPath + "/" + name + ".pem"
+// AddOrUpdateSecretFile creates a file with the specified name, content and mode.
+func (nginx *NginxController) AddOrUpdateSecretFile(name string, content []byte, mode os.FileMode) string {
+	filename := nginx.getSecretFileName(name)
 
 	if !nginx.local {
-		pem, err := os.Create(pemFileName)
+		file, err := ioutil.TempFile(nginx.nginxSecretsPath, name)
 		if err != nil {
-			glog.Fatalf("Couldn't create pem file %v: %v", pemFileName, err)
-		}
-		defer pem.Close()
-
-		_, err = pem.WriteString(key)
-		if err != nil {
-			glog.Fatalf("Couldn't write to pem file %v: %v", pemFileName, err)
+			glog.Fatalf("Couldn't create a temp file for the secret file %v: %v", name, err)
 		}
 
-		_, err = pem.WriteString("\n")
+		err = file.Chmod(mode)
 		if err != nil {
-			glog.Fatalf("Couldn't write to pem file %v: %v", pemFileName, err)
+			glog.Fatalf("Couldn't change the mode of the temp secret file %v: %v", file.Name(), err)
 		}
 
-		_, err = pem.WriteString(cert)
+		_, err = file.Write(content)
 		if err != nil {
-			glog.Fatalf("Couldn't write to pem file %v: %v", pemFileName, err)
+			glog.Fatalf("Couldn't write to the temp secret file %v: %v", file.Name(), err)
+		}
+
+		err = file.Close()
+		if err != nil {
+			glog.Fatalf("Couldn't close the temp secret file %v: %v", file.Name(), err)
+		}
+
+		err = os.Rename(file.Name(), filename)
+		if err != nil {
+			glog.Fatalf("Fail to rename the temp secret file %v to %v: %v", file.Name(), filename, err)
 		}
 	}
 
-	return pemFileName
+	return filename
+}
+
+// DeleteSecretFile the file with a Secret
+func (nginx *NginxController) DeleteSecretFile(name string) {
+	filename := nginx.getSecretFileName(name)
+	glog.V(3).Infof("deleting %v", filename)
+
+	if !nginx.local {
+		if err := os.Remove(filename); err != nil {
+			glog.Warningf("Failed to delete %v: %v", filename, err)
+		}
+	}
+
 }
 
 func (nginx *NginxController) getIngressNginxConfigFileName(name string) string {
 	return path.Join(nginx.nginxConfdPath, name+".conf")
 }
 
+func (nginx *NginxController) getSecretFileName(name string) string {
+	return path.Join(nginx.nginxSecretsPath, name)
+}
+
 func (nginx *NginxController) templateIt(config IngressNginxConfig, filename string) {
-	tmpl, err := template.New("ingress.tmpl").ParseFiles("ingress.tmpl")
+	tmpl, err := template.New(nginx.nginxIngressTempatePath).ParseFiles(nginx.nginxIngressTempatePath)
 	if err != nil {
-		glog.Fatal("Failed to parse template file")
+		glog.Fatalf("Failed to parse template file: %v", err)
 	}
 
 	glog.V(3).Infof("Writing NGINX conf to %v", filename)
@@ -242,13 +291,30 @@ func (nginx *NginxController) Reload() error {
 }
 
 // Start starts NGINX
-func (nginx *NginxController) Start() {
+func (nginx *NginxController) Start(done chan error) {
 	if !nginx.local {
-		if err := shellOut("nginx"); err != nil {
+		cmd := exec.Command("nginx")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
 			glog.Fatalf("Failed to start nginx: %v", err)
 		}
+		go func() {
+			done <- cmd.Wait()
+		}()
 	} else {
 		glog.V(3).Info("Starting nginx")
+	}
+}
+
+// Quit shutdowns NGINX gracefully
+func (nginx *NginxController) Quit() {
+	if !nginx.local {
+		if err := shellOut("nginx -s quit"); err != nil {
+			glog.Fatalf("Failed to quit nginx: %v", err)
+		}
+	} else {
+		glog.V(3).Info("Quitting nginx")
 	}
 }
 
@@ -285,7 +351,7 @@ func shellOut(cmd string) (err error) {
 func (nginx *NginxController) UpdateMainConfigFile(cfg *NginxMainConfig) {
 	cfg.HealthStatus = nginx.healthStatus
 
-	tmpl, err := template.New("nginx.conf.tmpl").ParseFiles("nginx.conf.tmpl")
+	tmpl, err := template.New(nginx.nginxConfTemplatePath).ParseFiles(nginx.nginxConfTemplatePath)
 	if err != nil {
 		glog.Fatalf("Failed to parse the main config template file: %v", err)
 	}

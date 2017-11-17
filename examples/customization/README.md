@@ -17,9 +17,10 @@ The table below summarizes some of the options. More options (extensions) are av
 | `nginx.org/proxy-pass-headers` | `proxy-pass-headers` | Sets the value of one or more   [proxy_pass_header](http://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_pass_header) directives. Example: `"nginx.org/proxy-pass-headers": "header-a,header-b"` | N/A |
 | N/A | `server-names-hash-bucket-size` | Sets the value of the [server_names_hash_bucket_size](http://nginx.org/en/docs/http/ngx_http_core_module.html#server_names_hash_bucket_size) directive. | Depends on the size of the processor’s cache line. |
 | N/A | `server-names-hash-max-size` | Sets the value of the [server_names_hash_max_size](http://nginx.org/en/docs/http/ngx_http_core_module.html#server_names_hash_max_size) directive. | `512` |
-| `nginx.org/http2` | `http2` | Enables HTTP/2 in servers with SSL enabled. | `False` |
+| N/A | `http2` | Enables HTTP/2 in servers with SSL enabled. | `False` |
 | `nginx.org/redirect-to-https` | `redirect-to-https` | Sets the 301 redirect rule based on the value of the `http_x_forwarded_proto` header on the server block to force incoming traffic to be over HTTPS. Useful when terminating SSL in a load balancer in front of the Ingress controller — see [115](https://github.com/nginxinc/kubernetes-ingress/issues/115) | `False` |
-| N/A | `log-format` | Sets the custom [log format](http://nginx.org/en/docs/http/ngx_http_log_module.html#log_format).  | See the [template file](../../nginx-controller/nginx/nginx.conf.tmpl). |  
+| `ingress.kubernetes.io/ssl-redirect` | `ssl-redirect` | Sets an unconditional 301 redirect rule for all incoming HTTP traffic to force incoming traffic over HTTPS. | `True` |
+| N/A | `log-format` | Sets the custom [log format](http://nginx.org/en/docs/http/ngx_http_log_module.html#log_format).  | See the [template file](../../nginx-controller/nginx/nginx.conf.tmpl). |
 | `nginx.org/hsts` | `hsts` | Enables [HTTP Strict Transport Security (HSTS)](https://www.nginx.com/blog/http-strict-transport-security-hsts-and-nginx/): the HSTS header is added to the responses from backends. The `preload` directive is included in the header. | `False` |
 | `nginx.org/hsts-max-age` | `hsts-max-age` | Sets the value of the `max-age` directive of the HSTS header. | `2592000` (1 month) |
 | `nginx.org/hsts-include-subdomains` | `hsts-include-subdomains` | Adds the `includeSubDomains` directive to the HSTS header. | `False`|
@@ -30,10 +31,18 @@ The table below summarizes some of the options. More options (extensions) are av
 | N/A | `set-real-ip-from` | Sets the value of the [set_real_ip_from](http://nginx.org/en/docs/http/ngx_http_realip_module.html#set_real_ip_from) directive. | N/A |
 | N/A | `real-ip-header` | Sets the value of the [real_ip_header](http://nginx.org/en/docs/http/ngx_http_realip_module.html#real_ip_header) directive. | `X-Real-IP`|
 | N/A | `real-ip-recursive` | Enables or disables the [real_ip_recursive](http://nginx.org/en/docs/http/ngx_http_realip_module.html#real_ip_recursive) directive. | `False`|
-| `nginx.org/server-tokens` | `server-tokens` | Enables or disables the [server_tokens](http://nginx.org/en/docs/http/ngx_http_core_module.html#server_tokens) directive. Additionally, with the NGINX Plus controller, you can specify a custom string value. The empty string value disables the emission of the “Server” field. | `True`|
+| `nginx.org/server-tokens` | `server-tokens` | Enables or disables the [server_tokens](http://nginx.org/en/docs/http/ngx_http_core_module.html#server_tokens) directive. Additionally, with the NGINX Plus, you can specify a custom string value, including the empty string value, which disables the emission of the “Server” field. | `True`|
+| N/A | `main-snippets` | Sets a custom snippet in main context. | N/A |
 | N/A | `http-snippets` | Sets a custom snippet in http context. | N/A |
 | `nginx.org/location-snippets` | `location-snippets` | Sets a custom snippet in location context. | N/A |
 | `nginx.org/server-snippets` | `server-snippets` | Sets a custom snippet in server context. | N/A |
+| `nginx.org/lb-method` | `lb-method` | Sets the [load balancing method](https://www.nginx.com/resources/admin-guide/load-balancer/#method). The default `""` specifies the round-robin method. | `""` |
+| `nginx.org/listen-ports` | N/A | Configures HTTP ports that NGINX will listen on. | `[80]` |
+| `nginx.org/listen-ports-ssl` | N/A | Configures HTTPS ports that NGINX will listen on. | `[443]` |
+| N/A | `worker-processes` | Sets the value of the [worker_processes](http://nginx.org/en/docs/ngx_core_module.html#worker_processes) directive. | `auto` |
+| N/A | `worker-cpu-affinity` | Sets the value of the [worker_cpu_affinity](http://nginx.org/en/docs/ngx_core_module.html#worker_cpu_affinity) directive. | N/A |
+| N/A | `worker-shutdown-timeout` | Sets the value of the [worker_shutdown_timeout](http://nginx.org/en/docs/ngx_core_module.html#worker_shutdown_timeout) directive. | N/A |
+| `nginx.org/keepalive` | `keepalive` | Sets the value of the [keepalive](http://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive) directive. Note that `proxy_set_header Connection "";` is added to the generated configuration when the value > 0. | `0` |
 
 ## Using ConfigMaps
 
@@ -44,29 +53,29 @@ the config map to use with the following format: `<namespace>/<name>`. See [ngin
 
 1. Create a configmaps file with the name *nginx-config.yaml* and set the values
 that make sense for your setup:
-  ```yaml
-  kind: ConfigMap
-  apiVersion: v1
-  metadata:
-    name: nginx-config
-  data:
-    proxy-connect-timeout: "10s"
-    proxy-read-timeout: "10s"
-    client-max-body-size: "2m"
-  ```
-  See the **nginx-config.yaml** from this directory for a complete example.
+    ```yaml
+    kind: ConfigMap
+    apiVersion: v1
+    metadata:
+      name: nginx-config
+    data:
+      proxy-connect-timeout: "10s"
+      proxy-read-timeout: "10s"
+      client-max-body-size: "2m"
+    ```
+    See the **nginx-config.yaml** from this directory for a complete example.
 
-2. Create a configmaps resource:
-  ```
-  $ kubectl create -f nginx-config.yaml
-  ```
-  The NGINX configuration will be updated.
+1. Create a configmaps resource:
+    ```
+    $ kubectl create -f nginx-config.yaml
+    ```
+    The NGINX configuration will be updated.
 
-3. If you want to update the configmaps, update the file and replace the config map:
-  ```
-  $ kubectl replace -f nginx-config.yaml
-  ```
-  The NGINX configuration will be updated.
+1. If you want to update the configmaps, update the file and replace the config map:
+    ```
+    $ kubectl replace -f nginx-config.yaml
+    ```
+    The NGINX configuration will be updated.
 
 ## Using Annotations
 

@@ -1,6 +1,6 @@
 all: push
 
-VERSION = 0.8.1
+VERSION = 1.0.0
 TAG = $(VERSION)
 PREFIX = nginxdemos/nginx-ingress
 
@@ -10,6 +10,7 @@ DOCKERFILE = Dockerfile
 
 BUILD_IN_CONTAINER = 1
 PUSH_TO_GCR =
+GENERATE_DEFAULT_CERT_AND_KEY = 
 
 nginx-ingress:
 ifeq ($(BUILD_IN_CONTAINER),1)
@@ -25,7 +26,12 @@ else
 	go test ./...
 endif
 
-container: test nginx-ingress
+certificate-and-key: 
+ifeq ($(GENERATE_DEFAULT_CERT_AND_KEY),1)
+	./generate_default_cert_and_key.sh
+endif
+
+container: test nginx-ingress certificate-and-key
 	docker build -f $(DOCKERFILE) -t $(PREFIX):$(TAG) .
 
 push: container
